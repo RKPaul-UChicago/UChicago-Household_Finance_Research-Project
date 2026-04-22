@@ -1,0 +1,395 @@
+---
+title: "Did the COVID-19 Housing Boom Restore Great Recession Losses?
+Heterogeneous Effects Across the Income Distribution and Local Housing Markets
+"
+author: "Rajat Kanti Paul (CNet ID: rajatkpaul)"
+output: pdf_document
+---
+
+# Introduction
+
+This code file implements the empirical analysis for my final project. Using IPUMS USA ACS microdata for 2007, 2009, 2019, and 2021, the script constructs state- and PUMA-level measures of owner-occupied housing values, defines income groups, and computes Great Recession and COVID-era percentage changes. It then produces the summary statistics, regression estimates, and figures reported in the paper. The goal is to provide a transparent, fully reproducible implementation of the analysis so that the results can be verified.
+
+
+```{r setup, include=TRUE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(Hmisc)  
+library(broom)    
+options(scipen = 999)
+```
+
+
+# Data and Sample
+
+Data come from IPUMS USA 1-year American Community Survey (ACS) public-use microdata for **2007, 2009, 2019, and 2021**. The 2020 ACS is excluded due to Census Bureau warnings about COVID-related collection issues.
+
+**Variables used:** YEAR, STATEFIP, PUMA, GQ, OWNERSHP, HHINCOME, VALUEH, HHWT.
+
+```{r load-data}
+# Setting working directory
+setwd("~/Documents/MPP/Winter 2026/Household Finance/Final Project")
+
+# Reading the CSV
+hhdata <- read.csv("usa_00010.csv")
+```
+
+## Data Cleaning
+
+The sample is restricted to:
+
+- **Households only:** GQ codes 1 (1970 definition) and 2 (1990 definition), excluding vacant units and group quarters.
+- **Owner-occupied units:** OWNERSHP == 1.
+- **Valid income:** Dropping HHINCOME == 9999999 (missing/NIU).
+- **Valid housing values:** Dropping VALUEH codes 0 (N/A), 9999998 (missing), and 9999999 (missing/N/A).
+
+```{r clean-data}
+hhdata_clean <- hhdata %>%
+  filter(GQ %in% c(1, 2)) %>%           # Keeping households only
+  filter(OWNERSHP == 1) %>%              # Keeping owner-occupied units
+  filter(HHINCOME != 9999999) %>%        # Dropping missing household income
+  filter(!(VALUEH %in% c(0, 9999998, 9999999)))  # Dropping missing/NIU housing values
+```
+
+```{r data-summary}
+# Summary of cleaned data
+cat("Observations after cleaning:", nrow(hhdata_clean), "\n")
+cat("Number of unique states:", length(unique(hhdata_clean$STATEFIP)), "\n")
+cat("Number of unique PUMAs:", length(unique(hhdata_clean$PUMA)), "\n")
+```
+
+# Part 1: At State-level, Which Income Groups Recovered?
+
+This part examines how the recovery of housing wealth is distributed across the income spectrum at the state level. Income groups are defined using state-specific weighted 20th and 80th percentile thresholds of household income.
+
+## State-Specific Income Cutoffs and Group Assignment
+
+```{r state-income-cutoffs}
+# Weighted 20th and 80th percentile of income for each STATE & YEAR
+income_cutoffs_state <- hhdata_clean %>%
+  group_by(STATEFIP, YEAR) %>%
+  dplyr::summarize(
+    p20 = as.numeric(wtd.quantile(HHINCOME, weights = HHWT,
+                                   probs = 0.20, na.rm = TRUE)),
+    p80 = as.numeric(wtd.quantile(HHINCOME, weights = HHWT,
+                                   probs = 0.80, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+```{r state-income-groups}
+# Assigning state-level income group
+hhdata_income_state <- hhdata_clean %>%
+  left_join(income_cutoffs_state, by = c("STATEFIP", "YEAR")) %>%
+  mutate(
+    income_group = case_when(
+      HHINCOME <= p20 ~ "Low (bottom 20%)",
+      HHINCOME >= p80 ~ "High (top 20%)",
+      TRUE ~ "Middle (20-80%)"
+    )
+  )
+```
+
+## Weighted State-Level Averages (with Winsorizing)
+
+Housing values are winsorized at the 1st and 99th percentiles within each state & year & income group to reduce the impact of extreme outliers.
+
+```{r state-winsorize}
+# Winsorizing VALUEH within STATEFIP & YEAR & income_group at 1/99 percentiles
+hhdata_winsor_state <- hhdata_income_state %>%
+  group_by(STATEFIP, YEAR, income_group) %>%
+  mutate(
+    q01 = quantile(VALUEH, 0.01, na.rm = TRUE),
+    q99 = quantile(VALUEH, 0.99, na.rm = TRUE),
+    VALUEH_w = pmin(pmax(VALUEH, q01), q99)
+  ) %>%
+  ungroup()
+```
+
+```{r state-aggregate}
+# Weighted mean housing value by state, year, and income group
+state_year_group <- hhdata_winsor_state %>%
+  group_by(STATEFIP, YEAR, income_group) %>%
+  dplyr::summarize(
+    mean_value = weighted.mean(VALUEH_w, HHWT, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## Percentage Changes and Recovery Flags
+
+```{r state-changes}
+# Wide data: 2007, 2009, 2019, 2021 for each STATEFIP & income_group
+state_wide <- state_year_group %>%
+  filter(YEAR %in% c(2007, 2009, 2019, 2021)) %>%
+  pivot_wider(
+    id_cols = c(STATEFIP, income_group),
+    names_from = YEAR,
+    values_from = mean_value,
+    names_prefix = "val_"
+  )
+
+# Computing percentage changes and recovery flag
+state_analysis <- state_wide %>%
+  mutate(
+    pct_change_2007_2009 = 100 * (val_2009 - val_2007) / val_2007,
+    pct_change_2019_2021 = 100 * (val_2021 - val_2019) / val_2019,
+    pct_change_2019_2021_sq = pct_change_2019_2021^2,
+    recovered_to_2007 = if_else(val_2021 >= val_2007, 1L, 0L)
+  ) %>%
+  drop_na(val_2007, val_2009, val_2019, val_2021)
+```
+
+```{r state-recovery-summary}
+# Summary: share recovered by income group
+recovery_by_income_state <- state_analysis %>%
+  group_by(income_group) %>%
+  summarise(
+    n = n(),
+    share_recovered = mean(recovered_to_2007),
+    avg_drop_0709 = mean(pct_change_2007_2009),
+    avg_gain_1921 = mean(pct_change_2019_2021),
+    .groups = "drop"
+  )
+
+recovery_by_income_state
+```
+
+## Visualizing State-Level Income Group Recovery
+
+### Bar Chart: Recovery by Income Group
+
+```{r state-recovery-bar, fig.width=8, fig.height=5}
+ggplot(recovery_by_income_state,
+       aes(x = income_group, y = share_recovered)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Income Group",
+    y = "Share of state-income cells recovered to 2007 level",
+    title = "Recovery of Housing Values by Income Group"
+  ) +
+  theme_minimal()
+```
+
+This bar chart shows the fraction of state-income cells where housing values in 2021 are at or above their 2007 levels for low, middle, and high-income homeowners.
+
+## Linear Regression Analysis
+
+For each income group, the following regression is estimated at the state level:
+
+$$\%\Delta \text{Value}_{2007-2009} = \alpha + \beta \times \%\Delta \text{Value}_{2019-2021} + \varepsilon$$
+
+A negative $\beta$ indicates that states with bigger Great Recession losses tend to have larger COVID-era gains — consistent with recovery.
+
+```{r linear-models}
+# Splitting data by income group
+low_dat  <- filter(state_analysis, income_group == "Low (bottom 20%)")
+mid_dat  <- filter(state_analysis, income_group == "Middle (20-80%)")
+high_dat <- filter(state_analysis, income_group == "High (top 20%)")
+
+# Linear models
+lm_low  <- lm(pct_change_2007_2009 ~ pct_change_2019_2021, data = low_dat)
+lm_mid  <- lm(pct_change_2007_2009 ~ pct_change_2019_2021, data = mid_dat)
+lm_high <- lm(pct_change_2007_2009 ~ pct_change_2019_2021, data = high_dat)
+```
+
+```{r linear-results}
+# Linear regression results with significance
+cat("=== LOW INCOME (bottom 20%) ===\n")
+summary(lm_low)
+
+cat("\n=== MIDDLE INCOME (20-80%) ===\n")
+summary(lm_mid)
+
+cat("\n=== HIGH INCOME (top 20%) ===\n")
+summary(lm_high)
+```
+
+### Linear Model Scatter Plot
+
+```{r linear-plot, fig.width=10, fig.height=7}
+ggplot(state_analysis,
+       aes(x = pct_change_2019_2021,
+           y = pct_change_2007_2009,
+           color = income_group)) +
+  geom_point(size = 2.5, alpha = 0.7, stroke = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2, alpha = 0.9) +
+  scale_color_manual(values = c(
+    "Low (bottom 20%)"  = "#E31A1C",   # Bright red
+    "Middle (20-80%)"   = "#1F78B4",   # Blue
+    "High (top 20%)"    = "#FF7F00"    # Bright orange
+  )) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3, size = 4))) +
+  labs(
+    x = "% change in housing value (2019-2021)",
+    y = "% change in housing value (2007-2009)",
+    color = "Income group",
+    title = "Great Recession vs. COVID Housing Value Changes\n(bottom 20%, middle 60%, top 20% — weighted means, linear fit)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11, face = "bold")
+  )
+```
+
+Each point represents a state. The x-axis shows the percentage change in housing value during the COVID boom (2019-2021) and the y-axis shows the percentage change during the Great Recession (2007-2009). Separate regression lines are fitted for each income group.
+
+
+# Part 2: Did the Hardest-Hit Places Recover? (PUMA Level)
+
+This part uses PUMAs (Public Use Microdata Areas, approximately 100,000 people each) as the geographic unit to identify the local housing markets most severely hit during the Great Recession and to assess whether they recovered by 2021.
+
+Since PUMA codes are state-dependent, a unique identifier is created by combining STATEFIP and PUMA.
+
+## Constructing PUMA-Level Housing Values
+
+```{r puma-setup}
+# Creating unique PUMA identifier
+hhdata_puma <- hhdata_clean %>%
+  filter(!is.na(PUMA)) %>%
+  mutate(state_puma_id = paste0(STATEFIP, sprintf("%05d", PUMA)))
+
+cat("Number of unique state-PUMA combinations:", 
+    length(unique(hhdata_puma$state_puma_id)), "\n")
+```
+
+```{r puma-winsorize}
+# Winsorizing VALUEH within PUMA & YEAR at 1st and 99th percentiles
+hhdata_winsor_puma <- hhdata_puma %>%
+  group_by(state_puma_id, YEAR) %>%
+  mutate(
+    q01 = quantile(VALUEH, 0.01, na.rm = TRUE),
+    q99 = quantile(VALUEH, 0.99, na.rm = TRUE),
+    VALUEH_w = pmin(pmax(VALUEH, q01), q99)
+  ) %>%
+  ungroup()
+```
+
+```{r puma-aggregate}
+# Weighted mean housing value by PUMA and year
+puma_year <- hhdata_winsor_puma %>%
+  group_by(state_puma_id, YEAR) %>%
+  summarise(
+    mean_value = weighted.mean(VALUEH_w, HHWT, na.rm = TRUE),
+    STATEFIP = first(STATEFIP),
+    PUMA = first(PUMA),
+    .groups = "drop"
+  )
+
+# Reshaping wide: 2007, 2009, 2019, 2021 per PUMA
+puma_wide <- puma_year %>%
+  filter(YEAR %in% c(2007, 2009, 2019, 2021)) %>%
+  pivot_wider(
+    id_cols = c(state_puma_id, STATEFIP, PUMA),
+    names_from = YEAR,
+    values_from = mean_value,
+    names_prefix = "val"
+  )
+```
+
+```{r puma-changes}
+# Computing Great Recession drop and COVID boom gain
+puma_analysis <- puma_wide %>%
+  mutate(
+    pctchange_2007_2009 = 100 * (val2009 - val2007) / val2007,
+    pctchange_2019_2021 = 100 * (val2021 - val2019) / val2019
+  ) %>%
+  drop_na(val2007, val2009, val2019, val2021)
+
+cat("PUMAs with complete data:", nrow(puma_analysis), "\n")
+```
+
+## Defining "Decimated" PUMAs and Recovery
+
+"Decimated" PUMAs are defined as those in the bottom quartile of Great Recession housing value changes (i.e., the 25% of PUMAs with the largest percentage drops from 2007 to 2009). A PUMA is classified as "recovered" if its 2021 average home value is at or above its 2007 level.
+
+```{r decimated-define}
+# Defining "decimated" PUMAs as bottom quartile of 2007-2009 changes
+cutoff_decimated <- quantile(
+  puma_analysis$pctchange_2007_2009,
+  probs = 0.25,
+  na.rm = TRUE
+)
+
+cat("Decimation cutoff (25th percentile of 2007-2009 % change):", 
+    round(cutoff_decimated, 2), "%\n")
+
+puma_analysis <- puma_analysis %>%
+  mutate(
+    decimated = pctchange_2007_2009 <= cutoff_decimated,
+    recovered_to_2007 = if_else(val2021 >= val2007, 1L, 0L)
+  )
+```
+
+```{r decimated-summary}
+# Summary: Did hardest-hit PUMAs recover?
+recovery_by_decimation <- puma_analysis %>%
+  group_by(decimated) %>%
+  summarise(
+    n = n(),
+    share_recovered = mean(recovered_to_2007),
+    avg_drop_0709 = mean(pctchange_2007_2009),
+    avg_gain_1921 = mean(pctchange_2019_2021),
+    avg_gap_to_2007_2021 = mean(100 * (val2021 - val2007) / val2007),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    decimated_label = if_else(decimated, "Decimated PUMAs", "Other PUMAs")
+  )
+
+recovery_by_decimation
+```
+
+## Visualizing PUMA-Level Recovery
+
+### Scatterplot: Great Recession vs. COVID Boom
+
+```{r puma-scatter, fig.width=10, fig.height=7}
+ggplot(puma_analysis,
+       aes(x = pctchange_2019_2021,
+           y = pctchange_2007_2009,
+           color = decimated)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  scale_color_manual(values = c("FALSE" = "grey50", "TRUE" = "red"),
+                     labels = c("Other PUMAs", "Decimated PUMAs")) +
+  labs(
+    x = "COVID boom: % change in housing value, 2019-2021",
+    y = "Great Recession: % change in housing value, 2007-2009",
+    color = "PUMA type",
+    title = "Great Recession vs COVID Housing Changes at the PUMA Level",
+    subtitle = "Decimated PUMAs (worst 25% Great Recession crash) highlighted"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11, face = "bold")
+  )
+```
+
+Each dot represents a PUMA. The x-axis shows the COVID-era percentage change in housing value (2019-2021) and the y-axis shows the Great Recession percentage change (2007-2009). Decimated PUMAs are shown in red. A strong negative relationship would suggest that areas with bigger recession losses tended to receive larger COVID-era gains, consistent with a recovery pattern.
+
+### Bar Chart: Share of PUMAs That Fully Recovered
+
+```{r puma-bar, fig.width=8, fig.height=5}
+ggplot(recovery_by_decimation,
+       aes(x = decimated_label, y = share_recovered)) +
+  geom_col(aes(fill = decimated_label), show.legend = FALSE) +
+  scale_fill_manual(values = c("Decimated PUMAs" = "red", "Other PUMAs" = "grey50")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "",
+    y = "Share that recovered to 2007 housing value level",
+    title = "Did the Hardest-Hit Local Markets Fully Recover by 2021?"
+  ) +
+  theme_minimal()
+```
+
+This bar chart compares the fraction of PUMAs whose 2021 average home value is at or above their 2007 level for decimated versus non-decimated local markets.
+
